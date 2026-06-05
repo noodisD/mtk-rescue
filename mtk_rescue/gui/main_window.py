@@ -1,8 +1,11 @@
+import os
 from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QFont
 from PySide6.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -12,6 +15,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -19,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from ..core.checks import CHECKS
 from ..core.findings import Finding, Severity
+from ..core.log_parser import EventKind, LogEvent, LogParser
 from ..core.mtk import MtkClient, MtkClientNotFoundError
 from ..core.recipes import RECIPES, Recipe
 from ..core import udev
@@ -27,6 +33,25 @@ from ..core.usb import DeviceMode, detect_mode, usb_id
 
 POLL_INTERVAL_MS = 250  # need to be fast enough to catch ~4s BROM windows
 
+
+# Friendly display labels for parsed device-info keys.
+DEVICE_INFO_LABELS = {
+    "cpu": "CPU",
+    "hw_code": "HW code",
+    "target_config": "Target config",
+    "sbc_enabled": "SBC enabled",
+    "sla_enabled": "SLA enabled",
+    "me_id": "ME ID",
+    "soc_id": "SOC ID",
+    "ufs_blocksize": "UFS block size",
+    "ufs_id": "UFS ID",
+    "ufs_mid": "UFS MID",
+    "ufs_fwver": "UFS FW ver",
+    "ufs_serial": "UFS serial",
+    "ufs_lu0_size": "UFS LU0 size",
+    "ufs_lu1_size": "UFS LU1 size",
+    "ufs_lu2_size": "UFS LU2 size",
+}
 
 SEVERITY_COLORS = {
     Severity.OK: QColor("#2e7d32"),
@@ -46,7 +71,7 @@ SEVERITY_ICONS = {
 
 
 class RecipeWorker(QObject):
-    """Runs a Recipe in a worker thread, emitting log lines back to the UI.
+    """Runs a Recipe in a worker thread, emitting raw lines AND parsed events.
 
     Spawning mtkclient eagerly (before the phone is connected) is fine and useful:
     mtkclient has its own retry loop that grabs the device the instant it enumerates,
@@ -55,18 +80,22 @@ class RecipeWorker(QObject):
     """
 
     line = Signal(str)
+    event = Signal(LogEvent)
     finished = Signal(bool, str)  # success, message
 
-    def __init__(self, recipe: Recipe, mtk: MtkClient) -> None:
+    def __init__(self, recipe: Recipe, mtk: MtkClient, parser: LogParser) -> None:
         super().__init__()
         self._recipe = recipe
         self._mtk = mtk
+        self._parser = parser
 
     @Slot()
     def run(self) -> None:
         try:
             for line in self._recipe.runner(self._mtk):
                 self.line.emit(line)
+                for evt in self._parser.feed(line):
+                    self.event.emit(evt)
             self.finished.emit(True, "Recipe completed successfully.")
         except Exception as exc:  # noqa: BLE001
             self.finished.emit(False, f"Recipe failed: {exc}")
@@ -76,11 +105,14 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("mtk-rescue")
-        self.resize(1200, 760)
+        self.resize(1280, 820)
 
         self._thread: QThread | None = None
         self._worker: RecipeWorker | None = None
         self._last_mode: DeviceMode | None = None
+        self._parser = LogParser()
+        self._device_info: dict[str, str] = {}
+        self._handled_fixes: set[str] = set()
 
         self._build_menubar()
         self._build_ui()
@@ -121,8 +153,10 @@ class MainWindow(QMainWindow):
         outer.addWidget(self._status_label)
 
         splitter = QSplitter()
+        mono = QFont("Monospace")
+        mono.setStyleHint(QFont.StyleHint.TypeWriter)
 
-        # ---- left: findings ----
+        # ---- left: findings + device info + connection events ----
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.addWidget(QLabel("Findings"))
@@ -130,12 +164,20 @@ class MainWindow(QMainWindow):
         self._probe_button.clicked.connect(self._run_probe)
         left_layout.addWidget(self._probe_button)
         self._findings_list = QListWidget()
-        left_layout.addWidget(self._findings_list, 1)
+        self._findings_list.itemDoubleClicked.connect(self._on_finding_double_clicked)
+        left_layout.addWidget(self._findings_list, 2)
+
+        left_layout.addWidget(QLabel("Device info (parsed live from mtkclient)"))
+        self._device_info_table = QTableWidget(0, 2)
+        self._device_info_table.setHorizontalHeaderLabels(["Field", "Value"])
+        self._device_info_table.horizontalHeader().setStretchLastSection(True)
+        self._device_info_table.verticalHeader().setVisible(False)
+        self._device_info_table.setFont(mono)
+        self._device_info_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        left_layout.addWidget(self._device_info_table, 2)
 
         left_layout.addWidget(QLabel("Connection events"))
         self._events_list = QListWidget()
-        mono = QFont("Monospace")
-        mono.setStyleHint(QFont.StyleHint.TypeWriter)
         self._events_list.setFont(mono)
         left_layout.addWidget(self._events_list, 1)
 
@@ -168,7 +210,7 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self._stop_button)
         right_layout.addLayout(button_row)
 
-        right_layout.addWidget(QLabel("mtkclient log"))
+        right_layout.addWidget(QLabel("mtkclient log (raw)"))
         self._log = QTextEdit()
         self._log.setReadOnly(True)
         self._log.setFont(mono)
@@ -284,11 +326,16 @@ class MainWindow(QMainWindow):
         self._run_button.setEnabled(False)
         self._stop_button.setEnabled(True)
 
+        # Fresh parser state per run; preserve any findings already on screen.
+        self._parser.reset()
+        self._handled_fixes.clear()
+
         self._thread = QThread(self)
-        self._worker = RecipeWorker(recipe, mtk)
+        self._worker = RecipeWorker(recipe, mtk, self._parser)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.line.connect(self._log.append)
+        self._worker.event.connect(self._on_log_event)
         self._worker.finished.connect(self._on_recipe_finished)
         self._worker.finished.connect(self._thread.quit)
         self._thread.finished.connect(self._thread.deleteLater)
@@ -301,6 +348,121 @@ class MainWindow(QMainWindow):
         self._run_button.setEnabled(True)
         self._stop_button.setEnabled(False)
         self._worker = None
+
+    # ---- Parsed-event handling --------------------------------------------
+
+    @Slot(LogEvent)
+    def _on_log_event(self, evt: LogEvent) -> None:
+        if evt.kind == EventKind.DEVICE_INFO:
+            self._set_device_info(evt.key, evt.value)
+        elif evt.kind == EventKind.STATE:
+            ts = datetime.now().strftime("%H:%M:%S")
+            self._add_event(f"{ts}  STATE  {evt.key}: {evt.message}")
+        elif evt.kind == EventKind.ERROR:
+            self._add_error_finding(evt)
+
+    def _set_device_info(self, key: str, value: str) -> None:
+        label = DEVICE_INFO_LABELS.get(key, key)
+        self._device_info[key] = value
+        # Refresh table (sorted by friendly label for stable display)
+        rows = sorted(self._device_info.items(), key=lambda kv: DEVICE_INFO_LABELS.get(kv[0], kv[0]))
+        self._device_info_table.setRowCount(len(rows))
+        for row, (k, v) in enumerate(rows):
+            label_item = QTableWidgetItem(DEVICE_INFO_LABELS.get(k, k))
+            value_item = QTableWidgetItem(v)
+            self._device_info_table.setItem(row, 0, label_item)
+            self._device_info_table.setItem(row, 1, value_item)
+        self._device_info_table.resizeColumnsToContents()
+
+    def _add_error_finding(self, evt: LogEvent) -> None:
+        # Avoid duplicate findings for the same error key within one run.
+        if evt.key in self._handled_fixes:
+            return
+        self._handled_fixes.add(evt.key)
+
+        title = f"mtkclient error: {evt.key}"
+        summary = evt.message
+        suggested = ""
+        if evt.suggested_fix:
+            suggested = f"\n    → Double-click to apply fix ({evt.suggested_fix})"
+
+        text = f"{SEVERITY_ICONS[Severity.CRITICAL]} {title}\n    {summary}{suggested}"
+        item = QListWidgetItem(text)
+        item.setForeground(SEVERITY_COLORS[Severity.CRITICAL])
+        item.setData(0x0100, evt.suggested_fix)  # store fix code for double-click handler
+        self._findings_list.addItem(item)
+        self._findings_list.scrollToBottom()
+
+    def _on_finding_double_clicked(self, item: QListWidgetItem) -> None:
+        fix = item.data(0x0100)
+        if not fix:
+            return
+        if fix == "set_preloader":
+            self._action_set_preloader()
+        elif fix == "set_auth":
+            self._action_set_auth()
+        else:
+            QMessageBox.information(
+                self, "No automatic fix yet", f"Fix '{fix}' is recognised but not wired up yet."
+            )
+
+    def _action_set_preloader(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select stock preloader (preloader_<device>.bin)",
+            os.environ.get("HOME", ""),
+            "Preloader (preloader_*.bin);;All files (*)",
+        )
+        if not path:
+            return
+        p = Path(path)
+        if not p.exists():
+            QMessageBox.warning(self, "Not found", f"{p} does not exist.")
+            return
+        # Quick header sanity check — UFS_BOOT / EMMC_BOOT / COMBO_BOOT.
+        try:
+            head = p.read_bytes()[:8]
+            if head not in (b"UFS_BOOT", b"EMMC_BOO", b"COMBO_BO"):
+                # Check 8-byte prefixes properly
+                if not (head.startswith(b"UFS_BOOT")
+                        or head.startswith(b"EMMC_BOOT")[:8]
+                        or head.startswith(b"COMBO_BOOT")[:8]):
+                    res = QMessageBox.question(
+                        self,
+                        "Header mismatch",
+                        f"File doesn't start with UFS_BOOT / EMMC_BOOT / COMBO_BOOT — header is "
+                        f"{head!r}. Use anyway?",
+                    )
+                    if res != QMessageBox.StandardButton.Yes:
+                        return
+        except OSError as exc:
+            QMessageBox.warning(self, "Read failed", str(exc))
+            return
+
+        os.environ["MTK_RESCUE_PRELOADER"] = str(p)
+        QMessageBox.information(
+            self,
+            "Preloader set",
+            f"MTK_RESCUE_PRELOADER set to:\n{p}\n\n"
+            "The next 'Run / Arm recipe' will pass this to mtkclient. Re-run the recipe now.",
+        )
+
+    def _action_set_auth(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select auth file (auth_sv5.auth or similar)",
+            os.environ.get("HOME", ""),
+            "Auth (*.auth);;All files (*)",
+        )
+        if not path:
+            return
+        os.environ["MTK_RESCUE_AUTH"] = path
+        QMessageBox.information(
+            self,
+            "Auth set",
+            f"MTK_RESCUE_AUTH set to:\n{path}\n\n"
+            "Note: mtkclient invocation needs --auth wiring; coming in the next iteration.",
+        )
 
     def _stop_running(self) -> None:
         # Not implemented in MVP — mtkclient subprocess can be terminated by
