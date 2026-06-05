@@ -36,19 +36,24 @@ class MtkClient:
     def _build_cmd(self, args: tuple[str, ...]) -> list[str]:
         cmd: list[str] = []
         if self.use_sudo:
-            cmd.append("sudo")
-        cmd.extend(["python3", str(self.mtk_path), "--crash", *args])
+            cmd.extend(["sudo", "-E"])  # preserve PYTHONUNBUFFERED, MTK_RESCUE_MTKCLIENT
+        # -u forces unbuffered stdout/stderr in the mtkclient child, so its progress
+        # appears in the log live instead of after a 4 KB buffer fills.
+        cmd.extend(["python3", "-u", str(self.mtk_path), "--crash", *args])
         return cmd
 
     def stream(self, *args: str) -> Iterator[str]:
         """Run mtkclient and yield stdout lines as they arrive. Raises on non-zero exit."""
         cmd = self._build_cmd(args)
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=env,
         )
         assert proc.stdout is not None
         try:
