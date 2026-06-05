@@ -39,6 +39,13 @@ pip install -e ".[dev]"
 # Tell mtk-rescue where mtkclient lives:
 export MTK_RESCUE_MTKCLIENT=/root/android-flash/mtkclient/mtk.py
 
+# Strongly recommended: point at the stock preloader for your device.
+# Without this, mtkclient dumps the preloader from RAM and DRAM setup can
+# fail with "DRAM setup failed: unpack requires a buffer of 12 bytes" on
+# devices like begonia (Redmi Note 8 Pro). The file is in the stock
+# fastboot ROM under images/.
+export MTK_RESCUE_PRELOADER=/path/to/stock/images/preloader_begonia.bin
+
 mtk-rescue
 # Or:
 python -m mtk_rescue

@@ -36,10 +36,22 @@ class MtkClient:
     def _build_cmd(self, args: tuple[str, ...]) -> list[str]:
         cmd: list[str] = []
         if self.use_sudo:
-            cmd.extend(["sudo", "-E"])  # preserve PYTHONUNBUFFERED, MTK_RESCUE_MTKCLIENT
+            cmd.extend(["sudo", "-E"])  # preserve PYTHONUNBUFFERED, MTK_RESCUE_* env
         # -u forces unbuffered stdout/stderr in the mtkclient child, so its progress
         # appears in the log live instead of after a 4 KB buffer fills.
-        cmd.extend(["python3", "-u", str(self.mtk_path), "--crash", *args])
+        cmd.extend(["python3", "-u", str(self.mtk_path)])
+
+        # If the user supplied a stock preloader file, pass it through. This is the
+        # canonical fix for "DRAM setup failed: unpack requires a buffer of 12 bytes" —
+        # without --preloader, mtkclient tries to recover the EMI block by dumping the
+        # device's preloader from RAM, which fails on devices like begonia.
+        preloader_env = os.environ.get("MTK_RESCUE_PRELOADER")
+        if preloader_env:
+            p = Path(preloader_env)
+            if p.exists():
+                cmd.extend(["--preloader", str(p)])
+
+        cmd.extend(["--crash", *args])
         return cmd
 
     def stream(self, *args: str) -> Iterator[str]:
