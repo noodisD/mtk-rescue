@@ -1,11 +1,14 @@
+from datetime import datetime
+
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QAction, QColor, QFont
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenuBar,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -18,7 +21,11 @@ from ..core.checks import CHECKS
 from ..core.findings import Finding, Severity
 from ..core.mtk import MtkClient, MtkClientNotFoundError
 from ..core.recipes import RECIPES, Recipe
+from ..core import udev
 from ..core.usb import DeviceMode, detect_mode, usb_id
+
+
+POLL_INTERVAL_MS = 250  # need to be fast enough to catch ~4s BROM windows
 
 
 SEVERITY_COLORS = {
@@ -39,7 +46,13 @@ SEVERITY_ICONS = {
 
 
 class RecipeWorker(QObject):
-    """Runs a Recipe in a worker thread, emitting log lines back to the UI."""
+    """Runs a Recipe in a worker thread, emitting log lines back to the UI.
+
+    Spawning mtkclient eagerly (before the phone is connected) is fine and useful:
+    mtkclient has its own retry loop that grabs the device the instant it enumerates,
+    which is faster than us reacting to the USB event after the fact. This is how we
+    fit inside the ~4s BROM watchdog window.
+    """
 
     line = Signal(str)
     finished = Signal(bool, str)  # success, message
@@ -63,24 +76,42 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("mtk-rescue")
-        self.resize(1100, 720)
+        self.resize(1200, 760)
 
         self._thread: QThread | None = None
         self._worker: RecipeWorker | None = None
+        self._last_mode: DeviceMode | None = None
 
+        self._build_menubar()
         self._build_ui()
         self._refresh_usb_status()
 
         self._usb_timer = QTimer(self)
-        self._usb_timer.setInterval(2000)
+        self._usb_timer.setInterval(POLL_INTERVAL_MS)
         self._usb_timer.timeout.connect(self._refresh_usb_status)
         self._usb_timer.start()
+
+    # ---- UI construction ---------------------------------------------------
+
+    def _build_menubar(self) -> None:
+        bar = QMenuBar(self)
+        setup_menu = bar.addMenu("&Setup")
+
+        install_act = QAction("Install &udev rule", self)
+        install_act.triggered.connect(self._install_udev_rule)
+        setup_menu.addAction(install_act)
+
+        check_act = QAction("&Check udev status", self)
+        check_act.triggered.connect(self._check_udev_status)
+        setup_menu.addAction(check_act)
+
+        self.setMenuBar(bar)
 
     def _build_ui(self) -> None:
         central = QWidget(self)
         outer = QVBoxLayout(central)
 
-        # Top: USB status banner
+        # Status banner
         self._status_label = QLabel("Detecting device…")
         font = QFont()
         font.setPointSize(11)
@@ -89,18 +120,26 @@ class MainWindow(QMainWindow):
         self._status_label.setStyleSheet("padding: 8px; border-radius: 4px;")
         outer.addWidget(self._status_label)
 
-        # Middle: split between findings (left) and recipes+log (right)
         splitter = QSplitter()
 
+        # ---- left: findings ----
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.addWidget(QLabel("Findings"))
-        self._probe_button = QPushButton("Probe device")
+        self._probe_button = QPushButton("Probe device (read-only)")
         self._probe_button.clicked.connect(self._run_probe)
         left_layout.addWidget(self._probe_button)
         self._findings_list = QListWidget()
         left_layout.addWidget(self._findings_list, 1)
 
+        left_layout.addWidget(QLabel("Connection events"))
+        self._events_list = QListWidget()
+        mono = QFont("Monospace")
+        mono.setStyleHint(QFont.StyleHint.TypeWriter)
+        self._events_list.setFont(mono)
+        left_layout.addWidget(self._events_list, 1)
+
+        # ---- right: recipes + log ----
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.addWidget(QLabel("Recipes"))
@@ -108,19 +147,30 @@ class MainWindow(QMainWindow):
         for recipe in RECIPES.values():
             mark = " (writes!)" if recipe.writes_device else ""
             item = QListWidgetItem(f"{recipe.title}{mark}")
-            item.setData(0x0100, recipe.id)  # Qt::UserRole = 0x0100
+            item.setData(0x0100, recipe.id)
             self._recipes_list.addItem(item)
+        if self._recipes_list.count():
+            self._recipes_list.setCurrentRow(0)
         right_layout.addWidget(self._recipes_list)
 
-        self._run_button = QPushButton("Run selected recipe")
+        button_row = QHBoxLayout()
+        self._run_button = QPushButton("Run / Arm recipe")
+        self._run_button.setToolTip(
+            "If the phone is connected in BROM, the recipe runs now.\n"
+            "If the phone is OFFLINE, mtkclient is spawned and waits — enter BROM "
+            "(Vol Up + Vol Down + USB) and it will grab the device automatically."
+        )
         self._run_button.clicked.connect(self._run_selected_recipe)
-        right_layout.addWidget(self._run_button)
+        button_row.addWidget(self._run_button)
+        self._stop_button = QPushButton("Stop")
+        self._stop_button.setEnabled(False)
+        self._stop_button.clicked.connect(self._stop_running)
+        button_row.addWidget(self._stop_button)
+        right_layout.addLayout(button_row)
 
-        right_layout.addWidget(QLabel("Log"))
+        right_layout.addWidget(QLabel("mtkclient log"))
         self._log = QTextEdit()
         self._log.setReadOnly(True)
-        mono = QFont("Monospace")
-        mono.setStyleHint(QFont.StyleHint.TypeWriter)
         self._log.setFont(mono)
         right_layout.addWidget(self._log, 1)
 
@@ -132,21 +182,43 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-    # ---- USB status banner -------------------------------------------------
+    # ---- USB status polling ------------------------------------------------
 
     def _refresh_usb_status(self) -> None:
         mode = detect_mode()
+        if mode != self._last_mode:
+            self._on_mode_changed(self._last_mode, mode)
+            self._last_mode = mode
+
         text = f"USB: {usb_id(mode)}   |   Mode: {mode.value.upper()}"
-        if mode == DeviceMode.BROM:
-            color = "#2e7d32"
-        elif mode == DeviceMode.PRELOADER:
-            color = "#ef6c00"
-        else:
-            color = "#c62828"
+        color = {
+            DeviceMode.BROM: "#2e7d32",
+            DeviceMode.PRELOADER: "#ef6c00",
+            DeviceMode.OFFLINE: "#c62828",
+        }[mode]
         self._status_label.setText(text)
         self._status_label.setStyleSheet(
             f"padding: 8px; border-radius: 4px; color: white; background: {color};"
         )
+
+    def _on_mode_changed(self, prev: DeviceMode | None, new: DeviceMode) -> None:
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        prev_str = prev.value.upper() if prev is not None else "—"
+        self._add_event(f"{ts}  {prev_str} → {new.value.upper()}")
+
+        # Best-effort: detach cdc_acm/option whenever a device appears so it doesn't
+        # steal the interface from mtkclient. Idempotent and silent on failure.
+        if new in (DeviceMode.BROM, DeviceMode.PRELOADER):
+            detached = udev.detach_kernel_drivers()
+            if detached:
+                self._add_event(f"{ts}  detached: {', '.join(detached)}")
+
+    def _add_event(self, text: str) -> None:
+        self._events_list.addItem(QListWidgetItem(text))
+        self._events_list.scrollToBottom()
+        # Trim to last 200 lines
+        while self._events_list.count() > 200:
+            self._events_list.takeItem(0)
 
     # ---- Probe -------------------------------------------------------------
 
@@ -168,9 +240,13 @@ class MainWindow(QMainWindow):
     # ---- Recipe execution --------------------------------------------------
 
     def _run_selected_recipe(self) -> None:
+        if self._worker is not None:
+            QMessageBox.information(self, "Busy", "A recipe is already running.")
+            return
+
         item = self._recipes_list.currentItem()
         if item is None:
-            QMessageBox.information(self, "No recipe", "Select a recipe to run.")
+            QMessageBox.information(self, "No recipe", "Select a recipe.")
             return
         recipe_id = item.data(0x0100)
         recipe = RECIPES.get(recipe_id)
@@ -194,8 +270,19 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "mtkclient not found", str(exc))
             return
 
-        self._log.append(f"\n>>> {recipe.title}\n")
+        ts = datetime.now().strftime("%H:%M:%S")
+        mode = detect_mode()
+        if mode == DeviceMode.OFFLINE:
+            self._log.append(
+                f"\n[{ts}] >>> {recipe.title}\n"
+                f"[{ts}] Device is OFFLINE. mtkclient is starting and will wait.\n"
+                f"[{ts}] Enter BROM now: power off phone, hold Vol Up + Vol Down, plug USB.\n"
+            )
+        else:
+            self._log.append(f"\n[{ts}] >>> {recipe.title} (device is {mode.value.upper()})\n")
+
         self._run_button.setEnabled(False)
+        self._stop_button.setEnabled(True)
 
         self._thread = QThread(self)
         self._worker = RecipeWorker(recipe, mtk)
@@ -209,6 +296,42 @@ class MainWindow(QMainWindow):
 
     @Slot(bool, str)
     def _on_recipe_finished(self, success: bool, message: str) -> None:
-        self._log.append(f"<<< {message}\n")
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._log.append(f"[{ts}] <<< {message}\n")
         self._run_button.setEnabled(True)
+        self._stop_button.setEnabled(False)
         self._worker = None
+
+    def _stop_running(self) -> None:
+        # Not implemented in MVP — mtkclient subprocess can be terminated by
+        # killing it manually; we'll wire SIGTERM in the next iteration.
+        QMessageBox.information(
+            self,
+            "Not implemented yet",
+            "Use the terminal where mtk-rescue was launched and Ctrl-C, or kill the "
+            "mtkclient subprocess. Graceful cancel coming in the next iteration.",
+        )
+
+    # ---- Setup menu actions ------------------------------------------------
+
+    def _install_udev_rule(self) -> None:
+        ok, msg = udev.install_rule()
+        icon = QMessageBox.Icon.Information if ok else QMessageBox.Icon.Warning
+        box = QMessageBox(icon, "Install udev rule", msg, parent=self)
+        box.exec()
+
+    def _check_udev_status(self) -> None:
+        installed = udev.rule_installed()
+        if installed:
+            msg = (
+                f"udev rule is installed at {udev.UDEV_RULE_PATH}.\n\n"
+                "Kernel will grant userspace access to MTK devices and unbind "
+                "cdc_acm/option automatically."
+            )
+        else:
+            msg = (
+                f"udev rule is NOT installed.\n\n"
+                "Without it, the kernel may grab MTK devices as cdc_acm modems, "
+                "blocking mtkclient. Use Setup → Install udev rule."
+            )
+        QMessageBox.information(self, "udev rule status", msg)

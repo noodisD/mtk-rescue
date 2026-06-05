@@ -44,6 +44,30 @@ mtk-rescue
 python -m mtk_rescue
 ```
 
+### First-time setup: install the udev rule
+
+**Setup → Install udev rule** (from the menu bar) writes a udev rule that:
+- Grants the user libusb access to MTK BROM/Preloader devices (no `sudo` needed for USB)
+- Auto-unbinds `cdc_acm` and `option` (kernel serial-modem drivers) the moment an MTK
+  device enumerates, so they don't steal the interface from mtkclient
+
+This is critical on short-window deep bricks (where BROM only stays connected for a few
+seconds before resetting) — `cdc_acm` claiming the device eats ~500ms of that window.
+
+### Working with a short BROM window
+
+If your phone's BROM only stays up for a few seconds before resetting (low battery,
+watchdog timeout, etc.) — the "Run / Arm recipe" button works whether the device is
+connected or not:
+
+- If the device is connected: the recipe runs immediately.
+- If the device is OFFLINE: mtkclient is spawned and waits. Then you enter BROM (Vol Up
+  + Vol Down + USB) and mtkclient grabs the device the instant it enumerates, beating
+  the watchdog.
+
+The "Connection events" pane logs every BROM appear/disappear with timestamps so you
+can see the window pattern.
+
 ## Architecture
 
 ```
