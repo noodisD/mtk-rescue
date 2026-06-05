@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mtk-rescue"
+version = "0.1.0"
+description = "GUI diagnostic and recovery tool for bricked MediaTek phones"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "noodisD" }]
+dependencies = [
+    "PySide6>=6.6",
+    "pyusb>=1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+mtk-rescue = "mtk_rescue.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mtk_rescue"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
