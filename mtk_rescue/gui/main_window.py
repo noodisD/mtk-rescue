@@ -26,6 +26,7 @@ from ..core.checks import CHECKS
 from ..core.findings import Finding, Severity
 from ..core.log_parser import EventKind, LogEvent, LogParser
 from ..core.mtk import MtkClient, MtkClientNotFoundError
+from ..core.preloader import identify_preloader
 from ..core.recipes import RECIPES, Recipe
 from ..core import udev
 from ..core.usb import DeviceMode, detect_mode, usb_id
@@ -326,9 +327,12 @@ class MainWindow(QMainWindow):
         self._run_button.setEnabled(False)
         self._stop_button.setEnabled(True)
 
-        # Fresh parser state per run; preserve any findings already on screen.
+        # Fresh parser + findings state per run. The previous run's findings (e.g. a
+        # handshake_failed from an earlier probe attempt, or an auth_required that
+        # Kamakiri ended up bypassing) would otherwise stay on screen and mislead.
         self._parser.reset()
         self._handled_fixes.clear()
+        self._findings_list.clear()
 
         self._thread = QThread(self)
         self._worker = RecipeWorker(recipe, mtk, self._parser)
@@ -358,8 +362,21 @@ class MainWindow(QMainWindow):
         elif evt.kind == EventKind.STATE:
             ts = datetime.now().strftime("%H:%M:%S")
             self._add_event(f"{ts}  STATE  {evt.key}: {evt.message}")
+            # When Kamakiri bypasses security, the auth_required error from a few
+            # lines earlier becomes a non-issue. Drop it so the user isn't misled.
+            if evt.key == "security_bypassed":
+                self._dismiss_finding_by_key("auth_required")
         elif evt.kind == EventKind.ERROR:
             self._add_error_finding(evt)
+
+    def _dismiss_finding_by_key(self, error_key: str) -> None:
+        title_match = f"mtkclient error: {error_key}"
+        for row in range(self._findings_list.count()):
+            item = self._findings_list.item(row)
+            if item and title_match in item.text():
+                self._findings_list.takeItem(row)
+                self._handled_fixes.discard(error_key)
+                return
 
     def _set_device_info(self, key: str, value: str) -> None:
         label = DEVICE_INFO_LABELS.get(key, key)
@@ -419,31 +436,25 @@ class MainWindow(QMainWindow):
         if not p.exists():
             QMessageBox.warning(self, "Not found", f"{p} does not exist.")
             return
-        # Quick header sanity check — UFS_BOOT / EMMC_BOOT / COMBO_BOOT.
-        try:
-            head = p.read_bytes()[:8]
-            if head not in (b"UFS_BOOT", b"EMMC_BOO", b"COMBO_BO"):
-                # Check 8-byte prefixes properly
-                if not (head.startswith(b"UFS_BOOT")
-                        or head.startswith(b"EMMC_BOOT")[:8]
-                        or head.startswith(b"COMBO_BOOT")[:8]):
-                    res = QMessageBox.question(
-                        self,
-                        "Header mismatch",
-                        f"File doesn't start with UFS_BOOT / EMMC_BOOT / COMBO_BOOT — header is "
-                        f"{head!r}. Use anyway?",
-                    )
-                    if res != QMessageBox.StandardButton.Yes:
-                        return
-        except OSError as exc:
-            QMessageBox.warning(self, "Read failed", str(exc))
-            return
+        kind = identify_preloader(p)
+        if kind is None:
+            res = QMessageBox.question(
+                self,
+                "Unrecognised header",
+                "File doesn't start with any known preloader magic "
+                "(GFH MMM\\x01 / UFS_BOOT / EMMC_BOOT / COMBO_BOOT). Use anyway?",
+            )
+            if res != QMessageBox.StandardButton.Yes:
+                return
+            kind_note = "unknown magic"
+        else:
+            kind_note = f"detected: {kind}"
 
         os.environ["MTK_RESCUE_PRELOADER"] = str(p)
         QMessageBox.information(
             self,
             "Preloader set",
-            f"MTK_RESCUE_PRELOADER set to:\n{p}\n\n"
+            f"MTK_RESCUE_PRELOADER set to:\n{p}\n  ({kind_note})\n\n"
             "The next 'Run / Arm recipe' will pass this to mtkclient. Re-run the recipe now.",
         )
 

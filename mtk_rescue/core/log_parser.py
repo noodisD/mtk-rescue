@@ -191,11 +191,17 @@ PATTERNS: tuple[Pattern, ...] = (
         EventKind.ERROR,
         "auth_required",
         _just_msg(
-            "Device is auth-protected — supply an auth file via MTK_RESCUE_AUTH. "
-            "For begonia / many Xiaomi MTK, the Kamakiri payload bypasses this; if you "
-            "see this followed by 'Bypassing security' the actual run is fine."
+            "Device is auth-protected. If you see 'Bypassing security' next, "
+            "Kamakiri handled it and this can be ignored. Only supply MTK_RESCUE_AUTH "
+            "if the bypass fails."
         ),
         suggested_fix="set_auth",
+    ),
+    Pattern(
+        re.compile(r"Device is in BROM-Mode\. Bypassing security"),
+        EventKind.STATE,
+        "security_bypassed",
+        _just_msg("BROM-Mode security bypass active — auth_required can be ignored."),
     ),
     Pattern(
         re.compile(r"Couldn't detect partition:\s*(\S+)"),
